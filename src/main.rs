@@ -1,16 +1,21 @@
+use crate::slack::SlackBot; 
 use std::time::Duration;
 use std::env;
 use tokio::time;
-use ethers_rs::types::U256;
+use ethers::types::U256;
+use chrono::{DateTime, Utc};
+use chrono_tz::US::Eastern;
+
+pub mod slack; 
 
 #[tokio::main]
 async fn main() {
     // Load environment variables from .env file if it exists
     dotenvy::dotenv().ok();
     
-    println!("Starting periodic POST requests every hour...");
+    println!("Starting periodic POST requests ...");
     
-    let mut interval = time::interval(Duration::from_secs(3600)); // 1 hour = 3600 seconds
+    let mut interval = time::interval(Duration::from_secs(600)); // 1 hour = 3600 seconds
     
     loop {
         interval.tick().await;
@@ -39,44 +44,101 @@ async fn pulse_monitor(){
         }
     };
 
+
+    let cursor_block = match get_cursor_block().await {
+
+         Ok( block ) => Some(block),
+         Err(e) => {
+            eprintln!("Hasura API failed: {}", e);
+            None 
+        }
+
+
+
+    };
+
+   
+
+
+     println!("{:?}",network_block);
+     println!("{:?}",cursor_block);
+
+    // Only send Slack message if cursor is more than 10 blocks behind alchemy
+    if let (Some(alchemy_block), Some(cursor_block)) = (network_block, cursor_block) {
+        let block_difference = alchemy_block.saturating_sub(cursor_block);
+        
+        let BLOCK_DIFF_THRESHOLD = 10 ; 
+
+        if block_difference > U256::from( BLOCK_DIFF_THRESHOLD ) {
+            // Get current timestamp in New York time
+            let now_utc: DateTime<Utc> = Utc::now();
+            let now_ny = now_utc.with_timezone(&Eastern);
+            let timestamp = now_ny.format("%Y-%m-%d %H:%M:%S %Z").to_string();
+            
+            let message = format!(
+                "⚠️ Cursor is {} blocks behind!\nTimestamp: {}\nAlchemy Block: {}\nCursor Block: {}",
+                block_difference, timestamp, alchemy_block, cursor_block
+            );
+
+            let token = env::var("SLACK_OAUTH_TOKEN")
+                .expect("SLACK_OAUTH_TOKEN environment variable must be set");
+
+            // Create the bot instance
+            let bot = SlackBot::new(token);
+
+            let send_result = bot.send_message("#webserver-alerts", &message).await;
+            
+            match send_result {
+                Ok(_) => println!("Slack alert sent successfully"),
+                Err(e) => eprintln!("Failed to send Slack alert: {}", e),
+            }
+        } else {
+            println!("Cursor is within acceptable range ({} blocks behind)", block_difference);
+
+         /*   let token = env::var("SLACK_OAUTH_TOKEN")
+                .expect("SLACK_OAUTH_TOKEN environment variable must be set");
+
+              let bot = SlackBot::new(token);
+
+            let send_result = bot.send_message("#webserver-alerts", &format!("Cursor is synced. ")).await; */
+            
+            
+        }
+    } else {
+        eprintln!("Could not compare blocks - missing alchemy or cursor data");
+    }
+
+    
+
+
+
+}
+
+async fn get_cursor_block() -> Result<U256, Box<dyn std::error::Error>> {
+    let client = reqwest::Client::new();
+    
     //hit hasura for the cursor 
     let url = "https://hasura-mainnet.nfteller.org/v1/graphql";
-    let cursor_block = match make_post_request(&client, url).await {
+    let body = serde_json::json!({
+        "query": "query MyQuery { cursors { block_id block_num cursor id } }"
+    });
+    
+    match make_post_request(&client, url, body).await {
         Ok(response) => {
             println!("Hasura GraphQL request successful:");
             println!("{}", response);
             
             // Parse the response to get the cursor block
-            match parse_cursor_response(&response) {
-                Ok(block_num) => {
-                    println!("Cursor block number: {}", block_num);
-                    Some(block_num)
-                }
-                Err(e) => {
-                    eprintln!("Failed to parse cursor block: {}", e);
-                    None
-                }
-            }
+            parse_cursor_response(&response)
         }
         Err(e) => {
-            eprintln!("Hasura GraphQL request failed: {}", e);
-            None 
+            Err(e.into())
         }
-    };
-
-
-
-    println!("{:?}",network_block);
-     println!("{:?}",cursor_block);
-
+    }
 }
 
-
-
-async fn make_post_request(client: &reqwest::Client, url: &str) -> Result<String, reqwest::Error> {
-    let body = serde_json::json!({
-        "query": "query MyQuery { cursors { block_id block_num cursor id } }"
-    });
+async fn make_post_request(client: &reqwest::Client, url: &str, body: serde_json::Value) -> Result<String, reqwest::Error> {
+   
     
     let response = client
         .post(url)
